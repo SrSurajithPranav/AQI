@@ -1,90 +1,129 @@
-import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+import streamlit as st
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+import xgboost as xgb
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 
-# Load the dataset (historical AQI data)
-@st.cache_data
-def load_data():
-    file_path = 'cleaned_city_day.csv'  # Path to your dataset
-    data = pd.read_csv(file_path)
-    return data
+# Load the dataset
+file_path = '/content/cleaned_city_day.csv'  # Replace with your file path if necessary
+data = pd.read_csv(file_path)
 
-# Preprocess data: filter by city and return scaled AQI data
-def preprocess_data(data, city_name):
-    city_data = data[data['City'] == city_name]
-    city_data = city_data[['Date', 'AQI']].fillna(method='ffill')
-    city_data['Date'] = pd.to_datetime(city_data['Date'])
-    city_data.set_index('Date', inplace=True)
+# Encode the city names to numeric values
+label_encoder = LabelEncoder()
+data['City_encoded'] = label_encoder.fit_transform(data['City'])
 
-    # Feature scaling
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    city_data_scaled = scaler.fit_transform(city_data[['AQI']])
+# Drop non-numeric columns
+data.drop(['Date', 'AQI_Bucket', 'City'], axis=1, inplace=True)
+
+# Handle missing values
+data = data.ffill()
+
+# Split features (X) and target (y)
+X = data.drop(['AQI'], axis=1)
+y = data['AQI']
+
+# Store feature names
+features = X.columns
+
+# Scale the features
+scaler_features = MinMaxScaler()
+X_scaled = scaler_features.fit_transform(X)
+X_scaled = pd.DataFrame(X_scaled, columns=features)
+
+# Reshape the input for LSTM [samples, time_steps, features]
+X_lstm = X_scaled.values.reshape((X_scaled.shape[0], 1, X_scaled.shape[1]))
+
+# Split data into training and test sets
+X_train_lstm, X_test_lstm, y_train, y_test = train_test_split(X_lstm, y, test_size=0.2, random_state=42)
+
+# Build LSTM model
+lstm_model = Sequential()
+lstm_model.add(LSTM(50, activation='relu', input_shape=(X_train_lstm.shape[1], X_train_lstm.shape[2])))
+lstm_model.add(Dense(1))
+lstm_model.compile(optimizer='adam', loss='mse')
+
+# Train the LSTM model
+lstm_model.fit(X_train_lstm, y_train, batch_size=32, validation_split=0.2, epochs=10, verbose=0)
+
+# Get the output from the LSTM
+X_train_lstm_out = lstm_model.predict(X_train_lstm)
+X_test_lstm_out = lstm_model.predict(X_test_lstm)
+
+# Train the Random Forest using the LSTM output
+rf_model = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_model.fit(X_train_lstm_out, y_train)
+
+# Train the XGBoost model using Random Forest output
+xgb_model = xgb.XGBRegressor(n_estimators=100, learning_rate=0.1, random_state=42)
+xgb_model.fit(rf_model.predict(X_train_lstm_out).reshape(-1, 1), y_train)
+
+def predict_aqi_for_city(city_name):
+    city_encoded = label_encoder.transform([city_name])[0]
+    city_data = data[data['City_encoded'] == city_encoded]
     
-    return city_data_scaled, scaler
+    if city_data.empty:
+        return f"No data available for '{city_name}'."
+    
+    X_city = city_data.drop(['AQI'], axis=1)
+    X_city_scaled = scaler_features.transform(X_city)
+    X_city_lstm = X_city_scaled.reshape((X_city_scaled.shape[0], 1, X_city_scaled.shape[1]))
+    
+    city_lstm_out = lstm_model.predict(X_city_lstm)
+    city_rf_out = rf_model.predict(city_lstm_out).reshape(-1, 1)
+    aqi_prediction = xgb_model.predict(city_rf_out)
+    
+    return f"Predicted current AQI for {city_name}: {aqi_prediction[-1]:.2f}"
 
-# Create time-series data
-def create_time_series_data(data, time_steps=7):
-    X, y = [], []
-    for i in range(len(data) - time_steps):
-        X.append(data[i:i+time_steps, 0])
-        y.append(data[i+time_steps, 0])
-    return np.array(X), np.array(y)
-
-# Build and compile LSTM model
-def build_lstm_model(time_steps=7):
-    model = Sequential()
-    model.add(LSTM(50, return_sequences=True, input_shape=(time_steps, 1)))
-    model.add(LSTM(50))
-    model.add(Dense(1))
-    model.compile(optimizer='adam', loss='mean_squared_error')
-    return model
-
-# Predict the next day's AQI
 def predict_next_aqi(model, data, scaler, time_steps=7):
-    last_days = data[-time_steps:]
-    last_days_scaled = scaler.transform(last_days)
-    last_days_scaled = last_days_scaled.reshape((1, time_steps, 1))
-    
-    next_day_aqi_scaled = model.predict(last_days_scaled)
-    next_day_aqi = scaler.inverse_transform(next_day_aqi_scaled)
-    return next_day_aqi[0][0]
+    if len(data) < time_steps:
+        return "Not enough data points for prediction"
 
-# Main Streamlit app
-def main():
-    st.title('AQI Prediction by City')
+    # Ensure data has the same columns as the training data
+    data = data.reindex(columns=features, fill_value=0)
     
-    # Load data
-    data = load_data()
+    # Scale the data
+    data_scaled = scaler.transform(data)
     
-    # Select city
-    city_name = st.selectbox('Select City', data['City'].unique())
+    # Get the last 'time_steps' days of data
+    last_days = data_scaled[-time_steps:]
     
-    # Preprocess and display message
-    if st.button('Predict AQI'):
-        city_data_scaled, scaler = preprocess_data(data, city_name)
-        
-        # Create time-series data
-        time_steps = 7
-        X, y = create_time_series_data(city_data_scaled, time_steps)
-        X = X.reshape((X.shape[0], X.shape[1], 1))
-        
-        # Split data into training and test sets
-        split_ratio = 0.8
-        split = int(len(X) * split_ratio)
-        X_train, X_test = X[:split], X[split:]
-        y_train, y_test = y[:split], y[split:]
-        
-        # Build and train LSTM model
-        model = build_lstm_model(time_steps)
-        model.fit(X_train, y_train, epochs=5, batch_size=32, validation_data=(X_test, y_test), verbose=1)
-        
-        # Predict next day's AQI
-        predicted_aqi = predict_next_aqi(model, city_data_scaled, scaler, time_steps)
-        st.write(f'Predicted AQI for {city_name} for the next day: {predicted_aqi:.2f}')
+    # Reshape the input to (samples, time_steps, features)
+    last_days_reshaped = last_days.reshape((1, time_steps, last_days.shape[1]))
 
-if __name__ == '__main__':
-    main()
+    # Predict the AQI for the next day
+    next_day_aqi_scaled = model.predict(last_days_reshaped)
+
+    # Inverse transform to get the original scale
+    next_day_aqi = scaler.inverse_transform(np.hstack([next_day_aqi_scaled, np.zeros((next_day_aqi_scaled.shape[0], data.shape[1]-1))]))[0][0]
+    return next_day_aqi
+
+# Streamlit UI
+st.title("Air Quality Index (AQI) Prediction")
+
+# City selection
+city_name = st.selectbox("Select a city:", options=label_encoder.classes_)
+
+if st.button("Predict AQI"):
+    city_encoded = label_encoder.transform([city_name])[0]
+    city_data = data[data['City_encoded'] == city_encoded]
+    
+    if city_data.empty:
+        st.write(f"No data available for '{city_name}'. Please try another city.")
+    else:
+        # Predict AQI for the next day
+        next_day_features = city_data.drop(['AQI'], axis=1)
+        predicted_next_day_aqi = predict_next_aqi(lstm_model, next_day_features, scaler_features)
+        
+        if isinstance(predicted_next_day_aqi, str):
+            st.write(predicted_next_day_aqi)
+        else:
+            st.write(f"Predicted AQI for {city_name} for the next day: {predicted_next_day_aqi:.2f}")
+        
+        # Predict current AQI
+        current_aqi_prediction = predict_aqi_for_city(city_name)
+        st.write(current_aqi_prediction)
