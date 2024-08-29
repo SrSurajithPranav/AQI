@@ -1,5 +1,5 @@
-streamlit  # To run the Streamlit app
-pandas  # For data handling
-numpy  # For numerical computations
-scikit-learn  # For data preprocessing (MinMaxScaler)
-tensorflow  # For building and running the LSTM model
+streamlit==1.20.0  # Adjust to the latest compatible version
+pandas==2.0.0  # Adjust to the latest compatible version
+numpy==1.24.4  # Adjust to the latest compatible version
+scikit-learn==1.2.2  # Adjust to the latest compatible version
+tensorflow==2.14.0  # Adjust to the latest compatible version
